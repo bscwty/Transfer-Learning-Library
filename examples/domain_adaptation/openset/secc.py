@@ -16,11 +16,9 @@ import torchvision.transforms as T
 import torch.nn.functional as F
 
 sys.path.append('../../..')
-from dalib.modules.domain_discriminator import DomainDiscriminator
 from common.modules.classifier import Classifier
-from dalib.adaptation.dann import DomainAdversarialLoss, ImageClassifier
 import common.vision.datasets.openset as datasets
-from common.vision.datasets.openset import default_open_set as open_set
+from common.vision.datasets.openset import open_set
 import common.vision.models as models
 from common.vision.transforms import ResizeImage
 from common.utils.data import ForeverDataIterator
@@ -31,21 +29,22 @@ from common.utils.analysis import collect_feature, tsne, a_distance
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-seed = 0
+from dalib.adaptation.secc import FeatureExtractor, ImageClassifier, ClusterDistribution, ASoftmax, ConditionalEntropyLoss
+from dalib.adaptation.self_ensemble import EmaTeacher, L2ConsistencyLoss, ClassBalanceLoss
 
 def main(args: argparse.Namespace):
     logger = CompleteLogger(args.log, args.phase)
     print(args)
 
-    if seed is not None:
+    if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
         cudnn.deterministic = True
-        # warnings.warn('You have chosen to seed training. '
-        #               'This will turn on the CUDNN deterministic setting, '
-        #               'which can slow down your training considerably! '
-        #               'You may see unexpected behavior when restarting '
-        #               'from checkpoints.')
+        warnings.warn('You have chosen to seed training. '
+                      'This will turn on the CUDNN deterministic setting, '
+                      'which can slow down your training considerably! '
+                      'You may see unexpected behavior when restarting '
+                      'from checkpoints.')
 
     cudnn.benchmark = True
 
@@ -75,8 +74,19 @@ def main(args: argparse.Namespace):
     ])
 
     dataset = datasets.__dict__[args.data]
-    source_dataset = open_set(dataset, source=True)
-    target_dataset = open_set(dataset, source=False)
+
+    """
+    dataset settings for SECC
+    """
+    from common.vision.datasets.office31 import Office31
+    public_classes = Office31.CLASSES[:10]
+    source_private = Office31.CLASSES[10:20]
+    target_private = Office31.CLASSES[20:]
+
+    source_dataset = open_set(dataset, public_classes, source_private)
+    target_dataset = open_set(dataset, public_classes, target_private)
+    """"""
+
     train_source_dataset = source_dataset(root=args.root, task=args.source, download=True, transform=train_transform)
     train_source_loader = DataLoader(train_source_dataset, batch_size=args.batch_size,
                                      shuffle=True, num_workers=args.workers, drop_last=True)
@@ -85,31 +95,50 @@ def main(args: argparse.Namespace):
                                      shuffle=True, num_workers=args.workers, drop_last=True)
     val_dataset = target_dataset(root=args.root, task=args.target, download=True, transform=val_transform)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
-    if args.data == 'DomainNet':
-        test_dataset = target_dataset(root=args.root, task=args.target, split='test', download=True,
-                                      transform=val_transform)
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
-    else:
-        test_loader = val_loader
 
     train_source_iter = ForeverDataIterator(train_source_loader)
     train_target_iter = ForeverDataIterator(train_target_loader)
+
+    test_loader = val_loader
 
     # create model
     print("=> using pre-trained model '{}'".format(args.arch))
     num_classes = train_source_dataset.num_classes
     backbone = models.__dict__[args.arch](pretrained=True)
 
+    """
+    mean teacher model for SECC
+    """
+
     classifier = ImageClassifier(backbone, num_classes, bottleneck_dim=args.bottleneck_dim).to(device)
-    domain_discri = DomainDiscriminator(in_feature=classifier.features_dim, hidden_size=1024).to(device)
+    teacher = EmaTeacher(classifier, 0.9)
+
+    k = 25
+
+    """
+    distribution cluster for SECC
+    """
+    print("=> initiating k-means clusters")
+    feature_extractor = FeatureExtractor(backbone)
+    cluster_distribution = ClusterDistribution(train_target_loader, feature_extractor, k=k)
+
+    """
+    cluster assignment for SECC
+    """
+    cluster_assignment =ASoftmax(feature_extractor, num_clusters=k, num_features=cluster_distribution.num_features).to(device)
+    """
+    loss functions for SECC
+    """
+
+    kl_loss = nn.KLDivLoss().to(device)
+    conditional_loss = ConditionalEntropyLoss().to(device)
+    consistent_loss = L2ConsistencyLoss().to(device)
+    class_balance_loss = ClassBalanceLoss(num_classes).to(device)
 
     # define optimizer and lr scheduler
-    optimizer = SGD(classifier.get_parameters() + domain_discri.get_parameters(),
+    optimizer = SGD(classifier.get_parameters()+cluster_assignment.get_parameters(),
                     args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     lr_scheduler = LambdaLR(optimizer, lambda x:  args.lr * (1. + args.lr_gamma * float(x)) ** (-args.lr_decay))
-
-    # define loss function
-    domain_adv = DomainAdversarialLoss(domain_discri).to(device)
 
     # analysis the model
     if args.phase == 'analysis':
@@ -135,8 +164,10 @@ def main(args: argparse.Namespace):
     best_h_score = 0.
     for epoch in range(args.epochs):
         # train for one epoch
-        train(train_source_iter, train_target_iter, classifier, domain_adv, optimizer,
-              lr_scheduler, epoch, args)
+        train(train_source_iter, train_target_iter, classifier, teacher,
+              cluster_assignment, cluster_distribution,
+              consistent_loss, class_balance_loss, kl_loss, conditional_loss,
+              optimizer, lr_scheduler, epoch, args)
 
         # evaluate on validation set
         h_score = validate(val_loader, classifier, args)
@@ -158,14 +189,15 @@ def main(args: argparse.Namespace):
 
 
 def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
-          model: ImageClassifier, domain_adv: DomainAdversarialLoss, optimizer: SGD,
-          lr_scheduler: LambdaLR, epoch: int, args: argparse.Namespace):
+          model: ImageClassifier, teacher: EmaTeacher, cluster_assignment: ASoftmax, cluster_distribution: ClusterDistribution,
+          consistent_loss, class_balance_loss, kl_loss:nn.KLDivLoss, conditional_loss,
+          optimizer: SGD, lr_scheduler: LambdaLR, epoch: int, args: argparse.Namespace):
+
     batch_time = AverageMeter('Time', ':5.2f')
     data_time = AverageMeter('Data', ':5.2f')
     losses = AverageMeter('Loss', ':6.2f')
     cls_accs = AverageMeter('Cls Acc', ':3.1f')
     tgt_accs = AverageMeter('Tgt Acc', ':3.1f')
-    domain_accs = AverageMeter('Domain Acc', ':3.1f')
     progress = ProgressMeter(
         args.iters_per_epoch,
         [batch_time, data_time, losses, cls_accs, tgt_accs, domain_accs],
@@ -173,7 +205,6 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
 
     # switch to train mode
     model.train()
-    domain_adv.train()
 
     end = time.time()
     for i in range(args.iters_per_epoch):
@@ -191,13 +222,16 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         # compute output
         x = torch.cat((x_s, x_t), dim=0)
         y, f = model(x)
+        print(y.shape)
+        print(f.shape)
         y_s, y_t = y.chunk(2, dim=0)
         f_s, f_t = f.chunk(2, dim=0)
 
         cls_loss = F.cross_entropy(y_s, labels_s)
-        transfer_loss = domain_adv(f_s, f_t)
-        domain_acc = domain_adv.domain_discriminator_accuracy
-        loss = cls_loss + transfer_loss * args.trade_off
+        cdt_loss = conditional_loss(y_t)
+        kls_loss = kl_loss(cluster_assignment(f), cluster_distribution.calculate(f))
+
+        loss = cls_loss + cdt_loss + kls_loss
 
         cls_acc = accuracy(y_s, labels_s)[0]
         tgt_acc = accuracy(y_t, labels_t)[0]
@@ -205,7 +239,6 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         losses.update(loss.item(), x_s.size(0))
         cls_accs.update(cls_acc.item(), x_s.size(0))
         tgt_accs.update(tgt_acc.item(), x_s.size(0))
-        domain_accs.update(domain_acc.item(), x_s.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -265,7 +298,6 @@ def validate(val_loader: DataLoader, model: Classifier, args: argparse.Namespace
               .format(all=all_acc, known=known, unknown=unknown, h_score=h_score))
 
     return h_score
-
 
 if __name__ == '__main__':
     architecture_names = sorted(

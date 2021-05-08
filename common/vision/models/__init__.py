@@ -1,3 +1,3 @@
 from .resnet import *
 
-__all__ = ['resnet', 'digits']
+__all__ = ['resnet', 'digits', 'alexnet']
